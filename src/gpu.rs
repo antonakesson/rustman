@@ -25,6 +25,7 @@ pub struct Params {
     pub misc: [f32; 4],
     pub counts: [u32; 4],
     pub fx: [f32; 4],
+    pub obs: [f32; 4],
 }
 
 /// One frame of egui output, ready to draw.

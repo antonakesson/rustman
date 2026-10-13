@@ -15,6 +15,7 @@ const KEYS: &[(&str, &str)] = &[
     ("T", "emission-time view"),
     ("V", "Doppler color on/off"),
     ("[ / ]", "Doppler strength"),
+    ("O", "relativity on/off"),
     ("R", "half / full resolution"),
     ("Space", "pause"),
     ("H", "hide / show this panel"),
@@ -44,6 +45,8 @@ impl App {
                 } else {
                     ui.label(text);
                 }
+                let you = self.cam.vel.length();
+                ui.label(format!("you: {you:.1} m/s ({:.2}c)", you / c));
 
                 ui.separator();
                 ui.heading("Light");
@@ -60,6 +63,7 @@ impl App {
 
                 ui.separator();
                 ui.heading("View");
+                ui.checkbox(&mut self.relativity, "Relativity (aberration, beaming, contraction)");
                 ui.checkbox(&mut self.debug_age, "Emission-time view");
                 ui.checkbox(&mut self.doppler, "Doppler color");
                 ui.add_enabled(

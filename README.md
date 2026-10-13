@@ -13,6 +13,7 @@ Light moves at 8 m/s by default, so what you see is delayed: every surface shows
 - **Occlusion comes for free.** The nearest hit along the ray is also the latest in time, so ordinary nearest-hit tracing gives the correct answer.
 - **Chunked history.** History is split into 16-sample chunks with bounding spheres, so the shader skips whole time ranges a ray can't reach.
 - **Doppler shift.** Light paths are color-shifted by the relative motion of source and receiver. Physically correct strength puts most of the shift outside visible light at `c = 8`, so the default is turned down to 0.25 and adjustable.
+- **Special relativity for the camera too.** Walking boosts each camera ray from your moving frame into the room's frame. The view crowds into a tunnel ahead of you (aberration), turns bluer and brighter ahead and redder and dimmer behind (your own Doppler shift, plus radiance scaling as D⁴). Moving objects are length-contracted along their velocity, and every Doppler factor carries its γ term. Press `O` to compare against classical light delay.
 - Up to 4 bounces with mirrors, a moving lamp or a flashlight with shadows, plus an emission-time debug view that colors each pixel by how long ago its light was emitted.
 
 Built with [wgpu](https://wgpu.rs) (one compute pass for tracing, one render pass to blit and draw the [egui](https://github.com/emilk/egui) overlay) and [winit](https://github.com/rust-windowing/winit). The tracer is a single WGSL shader, `shaders/trace.wgsl`, and it hot-reloads when you save it.
@@ -38,6 +39,7 @@ cargo run --release
 | `M` | Lamp circles / stays still |
 | `V` | Doppler color on / off |
 | `[` / `]` | Doppler strength ÷1.5 / ×1.5 |
+| `O` | Relativity on / off (aberration, beaming, length contraction) |
 | `T` | Emission-time debug view |
 | `B` | Ambient light on / off |
 | `R` | Half / full resolution |

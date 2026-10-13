@@ -8,6 +8,7 @@
 //!   B              ambient on/off         R             half / full resolution
 //!   T              emission-time debug view
 //!   V              Doppler color on/off   [ / ]         Doppler strength /1.5 / x1.5
+//!   O              relativity on/off (aberration, beaming, length contraction)
 //!   Space          pause                  H             hide / show the control panel
 //!   Esc            quit
 
@@ -39,10 +40,16 @@ const HAND_OFFSET: (f32, f32) = (0.25, -0.2);
 const AMBIENT: f32 = 0.04;
 const FOV_Y: f32 = 70.0;
 const MOVE_SPEED: f32 = 3.0;
+/// How fast the camera eases toward its target velocity, 1/s. A sudden jump in velocity
+/// would snap the aberration.
+const CAM_ACCEL: f32 = 8.0;
+/// With relativity on, the camera can't reach c.
+const MAX_CAM_BETA: f32 = 0.9;
 const LOOK_SPEED: f32 = 0.003;
 
 struct Camera {
     pos: Vec3,
+    vel: Vec3,
     yaw: f32,
     pitch: f32,
 }
@@ -67,6 +74,9 @@ struct App {
     /// Shift colors by the Doppler factor along each light path.
     doppler: bool,
     doppler_strength: f32,
+    /// Special relativity: the camera's own aberration, Doppler and beaming, length
+    /// contraction, and gamma terms in the Doppler factors. Off = classical light delay.
+    relativity: bool,
     paused: bool,
     show_panel: bool,
     egui_ctx: egui::Context,
@@ -86,13 +96,14 @@ impl App {
         App {
             gpu: None,
             world: World::new(),
-            cam: Camera { pos: Vec3::new(0.0, 1.7, 8.25), yaw: 0.0, pitch: -0.1 },
+            cam: Camera { pos: Vec3::new(0.0, 1.7, 8.25), vel: Vec3::ZERO, yaw: 0.0, pitch: -0.1 },
             c: 8.0,
             infinite_c: false,
             ambient: true,
             debug_age: false,
             doppler: true,
             doppler_strength: DOPPLER_DEFAULT,
+            relativity: true,
             paused: false,
             show_panel: true,
             egui_ctx: egui::Context::default(),
@@ -123,6 +134,7 @@ impl App {
             KeyCode::KeyB => self.ambient = !self.ambient,
             KeyCode::KeyT => self.debug_age = !self.debug_age,
             KeyCode::KeyV => self.doppler = !self.doppler,
+            KeyCode::KeyO => self.relativity = !self.relativity,
             KeyCode::BracketLeft => self.doppler_strength = (self.doppler_strength / 1.5).max(0.02),
             KeyCode::BracketRight => self.doppler_strength = (self.doppler_strength * 1.5).min(4.0),
             KeyCode::Space => self.paused = !self.paused,
@@ -175,18 +187,32 @@ impl App {
                 mv += dir;
             }
         }
-        self.cam.pos += mv.normalize_or_zero() * MOVE_SPEED * dt;
+        let mut target = mv.normalize_or_zero() * MOVE_SPEED;
+        if self.relativity {
+            target = target.clamp_length_max(MAX_CAM_BETA * self.effective_c());
+        }
+        self.cam.vel += (target - self.cam.vel) * (1.0 - (-CAM_ACCEL * dt).exp());
         let margin = Vec3::splat(0.2);
-        self.cam.pos = self.cam.pos.clamp(sim::ROOM_MIN + margin, sim::ROOM_MAX - margin);
+        let next = self.cam.pos + self.cam.vel * dt;
+        self.cam.pos = next.clamp(sim::ROOM_MIN + margin, sim::ROOM_MAX - margin);
+        // Stop dead against a wall, or the view would keep its aberration while standing still.
+        for i in 0..3 {
+            if self.cam.pos[i] != next[i] {
+                self.cam.vel[i] = 0.0;
+            }
+        }
 
         let cam_right = fwd.cross(Vec3::Y).normalize();
         let hand = self.cam.pos + cam_right * HAND_OFFSET.0 + Vec3::Y * HAND_OFFSET.1;
-        self.world.light.hand = (hand, fwd);
 
         if !self.paused {
             // Fixed-step sim: history samples must be evenly spaced.
             self.accumulator = (self.accumulator + dt).min(0.25);
             while self.accumulator >= SIM_DT {
+                // Where the hand was when this tick ends, not where it is now. Otherwise the
+                // flashlight moves in per-frame jerks, and its Doppler shows them as stripes.
+                let behind = self.accumulator - SIM_DT;
+                self.world.light.hand = (hand - self.cam.vel * behind, fwd);
                 self.world.step();
                 self.accumulator -= SIM_DT;
             }
@@ -201,6 +227,7 @@ impl App {
         let r = right * tan_half * aspect;
         let u = up * tan_half;
         let p = self.cam.pos;
+        let v = self.cam.vel;
         Params {
             cam_pos: [p.x, p.y, p.z, self.effective_c()],
             cam_right: [r.x, r.y, r.z, 0.0],
@@ -209,6 +236,7 @@ impl App {
             misc: [SIM_DT, if self.world.light.flashlight { FLASHLIGHT_INTENSITY } else { LAMP_INTENSITY }, if self.ambient { AMBIENT } else { 0.0 }, if self.debug_age { 1.0 } else { 0.0 }],
             counts: [self.world.bodies.len() as u32, self.world.history_len() as u32, HIST_CAP as u32, 0],
             fx: [if self.doppler { self.doppler_strength } else { 0.0 }, 0.0, 0.0, 0.0],
+            obs: [v.x, v.y, v.z, if self.relativity { 1.0 } else { 0.0 }],
         }
     }
 
@@ -237,11 +265,12 @@ impl App {
         let c = if self.infinite_c { "inf".to_string() } else { format!("{:.1}", self.c) };
         let warn = if !self.infinite_c && self.world.max_speed > self.c { "  [objects faster than c!]" } else { "" };
         gpu.window.set_title(&format!(
-            "rustman  |  c = {c} m/s  |  {} {}{}  |  doppler {}  |  t = {:.1}s{}{}{}",
+            "rustman  |  c = {c} m/s  |  {} {}{}  |  doppler {}  |  {}  |  t = {:.1}s{}{}{}",
             if self.world.light.flashlight { "flashlight" } else { "lamp" },
             if self.world.light.on { "ON" } else { "off" },
             if self.world.light.moving && !self.world.light.flashlight { " (moving)" } else { "" },
             if self.doppler { format!("x{:.2}", self.doppler_strength) } else { "off".to_string() },
+            if self.relativity { "relativistic" } else { "classical" },
             self.world.time,
             if self.paused { "  PAUSED" } else { "" },
             if self.debug_age { "  [emission-time view]" } else { "" },

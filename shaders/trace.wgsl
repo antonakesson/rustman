@@ -4,6 +4,10 @@
 // Objects are world tubes: spinning spheres and boxes swept along their recorded history.
 // Nearest-hit in s is automatically latest-in-t, so occlusion needs no special care.
 // Times are relative to the observer: t = 0 is "now", history sample k is at -k*dt.
+//
+// With relativity on (obs.w), the camera's own velocity boosts each primary ray from the
+// camera frame into the room frame (aberration, observer Doppler, beaming), moving objects
+// are length-contracted along their velocity, and the Doppler factors gain their gamma terms.
 
 struct Params {
     cam_pos: vec4f,   // w = c
@@ -13,6 +17,7 @@ struct Params {
     misc: vec4f,      // x = history dt, y = light intensity, z = ambient, w = debug view (1 = emission time)
     counts: vec4u,    // x = bodies (the light is object x), y = valid samples, z = capacity
     fx: vec4f,        // x = Doppler color strength (0 = off, 1 = physical)
+    obs: vec4f,       // xyz = camera velocity, w = relativity on
 }
 
 struct Obj {
@@ -39,6 +44,31 @@ const KIND_ROOM: u32 = 3u;
 
 fn light_speed() -> f32 { return P.cam_pos.w; }
 fn hist_dt() -> f32 { return P.misc.x; }
+fn relativity_on() -> bool { return P.obs.w > 0.5; }
+
+// Lorentz factor, 1 with relativity off. Capped at v = 0.995c so objects pushed past c
+// (by lowering it) still render instead of going singular.
+fn gamma(v: vec3f) -> f32 {
+    if (!relativity_on()) { return 1.0; }
+    let c = light_speed();
+    return inverseSqrt(max(1.0 - dot(v, v) / (c * c), 0.01));
+}
+
+// A body moving at v is shorter by 1/g along v. This maps a room-frame offset from its
+// center back to its rest frame. It is symmetric, so it also maps normals the other way.
+fn uncontract(x: vec3f, v: vec3f, g: f32) -> vec3f {
+    let v2 = dot(v, v);
+    if (v2 < 1e-12) { return x; }
+    return x + (g - 1.0) * dot(x, v) / v2 * v;
+}
+
+// Photon direction n seen by an observer moving at b = v/c, as seen in the room frame
+// (relativistic velocity addition for a speed-c particle).
+fn boost_dir(n: vec3f, b: vec3f) -> vec3f {
+    let g = inverseSqrt(max(1.0 - dot(b, b), 1e-4));
+    let bn = dot(b, n);
+    return normalize((n / g + b * (1.0 + g / (g + 1.0) * bn)) / (1.0 + bn));
+}
 // History: per object, newest first, two vec4 per sample:
 // [position, payload] and [rotation quaternion] (light: [position, on] and [direction, cone]).
 fn sample(obj: u32, k: u32) -> vec4f { return hist[(obj * P.counts.z + k) * 2u]; }
@@ -123,6 +153,7 @@ struct ShapeHit {
     w: f32,       // sample payload (light: on flag)
     rot: vec4f,   // orientation at the emission time
     vel: vec3f,   // world velocity of the hit surface point (translation + spin)
+    tvel: vec3f,  // translational velocity, which sets the length contraction
 }
 
 // First crossing of the null ray with an object's world tube.
@@ -131,9 +162,10 @@ struct ShapeHit {
 //
 // Inside one segment the object moves linearly, so put the ray in its moving frame:
 //   o' = R^T (o - pa - v*(t0 - ta)),  d' = R^T (d + v/c)
-// Any static ray-shape test on (o', d') then returns the same s.
+// Any static ray-shape test on (o', d') then returns the same s. Length contraction is one
+// more linear map (uncontract) applied before R^T, so the same holds with it.
 fn hit_shape(obj: u32, shape: vec4f, o: vec3f, d: vec3f, t0: f32, s_max: f32) -> ShapeHit {
-    var res = ShapeHit(MISS, vec3f(0.0), 0.0, vec4f(0.0, 0.0, 0.0, 1.0), vec3f(0.0));
+    var res = ShapeHit(MISS, vec3f(0.0), 0.0, vec4f(0.0, 0.0, 0.0, 1.0), vec3f(0.0), vec3f(0.0));
     let radius = bound_radius(shape);
     let valid = P.counts.y;
     if (valid < 2u) { return res; }
@@ -175,30 +207,39 @@ fn hit_shape(obj: u32, shape: vec4f, o: vec3f, d: vec3f, t0: f32, s_max: f32) ->
             let disc = B * B - A * C;
             if (disc < 0.0) { continue; }
             let sq = sqrt(disc);
+            // Contraction only shrinks the body, so the bounding sphere still holds.
             var s = (-B - sq) / A;
             if (s >= seg_hi || (-B + sq) / A < seg_lo) { continue; }
+            let g = gamma(v);
+            let mr = uncontract(m, v, g);
+            let wr = uncontract(w, v, g);
             // Orientation at s, as a fraction of the way from sample k to k+1.
             let qa = sample_rot(obj, k);
             let qb = sample_rot(obj, k + 1u);
             let s_ta = (t0 - ta) * c;
             var q = quat_nlerp(qa, qb, clamp((s - s_ta) / (h * c), 0.0, 1.0));
-            if (is_box(shape)) {
+            if (is_box(shape) || g > 1.0 + 1e-6) {
                 // Solve with the orientation at the bounding-sphere entry, then once more
                 // with the orientation at that hit. Two passes are plenty at 60 Hz.
-                let s1 = shape_enter(shape, quat_unrotate(q, m), quat_unrotate(q, w));
+                // A contracted sphere is an ellipsoid, so it needs the real test too.
+                let s1 = shape_enter(shape, quat_unrotate(q, mr), quat_unrotate(q, wr));
                 if (s1 >= MISS) { continue; }
-                q = quat_nlerp(qa, qb, clamp((s1 - s_ta) / (h * c), 0.0, 1.0));
-                s = shape_enter(shape, quat_unrotate(q, m), quat_unrotate(q, w));
+                s = s1;
+                if (is_box(shape)) {
+                    q = quat_nlerp(qa, qb, clamp((s1 - s_ta) / (h * c), 0.0, 1.0));
+                    s = shape_enter(shape, quat_unrotate(q, mr), quat_unrotate(q, wr));
+                }
             }
             if (s >= seg_lo && s < seg_hi && s > EPS && s < s_max) {
                 res.s = s;
-                res.local = quat_unrotate(q, m + w * s);
+                res.local = quat_unrotate(q, mr + wr * s);
                 res.w = sa.w;
                 res.rot = q;
                 // The light's second row is its aim, not a rotation: it doesn't spin.
                 var spin = vec3f(0.0);
                 if (obj < P.counts.x) { spin = angular_velocity(qa, qb, h); }
-                res.vel = v + cross(spin, quat_rotate(q, res.local));
+                res.vel = v + cross(spin, m + w * s);
+                res.tvel = v;
                 return res;
             }
         }
@@ -342,14 +383,16 @@ fn shade_diffuse(p: vec3f, n: vec3f, u: vec3f, tp: f32, albedo: vec3f) -> Shade 
     return sh;
 }
 
-// Classical Doppler factors (received / emitted frequency) in the room frame, where light
-// moves at c in every direction. `dir` is the photon's direction of travel.
+// Doppler factors (received / emitted frequency) in the room frame, where light moves at c
+// in every direction. `dir` is the photon's direction of travel. Classical with relativity
+// off; with it on, the gamma terms make them exact (each end measures
+// gamma * (1 - v.dir / c) times the room-frame frequency).
 fn doppler_out(emitter_vel: vec3f, dir: vec3f) -> f32 {
-    return 1.0 / max(1.0 - dot(emitter_vel, dir) / light_speed(), 0.05);
+    return 1.0 / max(gamma(emitter_vel) * (1.0 - dot(emitter_vel, dir) / light_speed()), 0.05);
 }
 
 fn doppler_in(receiver_vel: vec3f, dir: vec3f) -> f32 {
-    return max(1.0 - dot(receiver_vel, dir) / light_speed(), 0.05);
+    return max(gamma(receiver_vel) * (1.0 - dot(receiver_vel, dir) / light_speed()), 0.05);
 }
 
 // Doppler color. Each RGB channel is a narrow band (610, 550, 465 nm). A factor D moves
@@ -388,6 +431,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     var color = vec3f(0.0);
     var age = 0.0; // debug: how long ago the light left the last surface hit
     var shift = 1.0; // Doppler factor along the path so far (received at camera / emitted here)
+    var beaming = 1.0;
+    if (relativity_on()) {
+        // d is the camera-frame ray; the photon travels along -d. Find its room-frame path.
+        let u = P.obs.xyz;
+        d = -boost_dir(-d, u / light_speed());
+        // The moving camera is the receiver at the end of the path.
+        shift = doppler_in(u, -d);
+        // Radiance scales as D^4 (I_nu / nu^3 is invariant): bright ahead, dim behind.
+        beaming = shift * shift * shift * shift;
+    }
 
     for (var bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
         let room = hit_room(o, d);
@@ -396,7 +449,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         var kind = KIND_ROOM;
         var albedo = vec3f(0.0);
         var payload = 0.0;
-        var best = ShapeHit(MISS, vec3f(0.0), 0.0, vec4f(0.0, 0.0, 0.0, 1.0), vec3f(0.0));
+        var best = ShapeHit(MISS, vec3f(0.0), 0.0, vec4f(0.0, 0.0, 0.0, 1.0), vec3f(0.0), vec3f(0.0));
         var best_i = 0u;
         // Bodies plus the light bulb (object counts.x).
         for (var i = 0u; i <= P.counts.x; i++) {
@@ -412,7 +465,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         if (best.s < MISS) {
             let shape = objs[best_i].shape;
             let nl = shape_normal(shape, best.local);
-            n = quat_rotate(best.rot, nl);
+            // Normals map through the same contraction (transpose of the inverse).
+            n = normalize(uncontract(quat_rotate(best.rot, nl), best.tvel, gamma(best.tvel)));
             kind = u32(objs[best_i].albedo.w);
             albedo = objs[best_i].albedo.xyz;
             payload = best.w;
@@ -453,6 +507,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         textureStore(out_tex, gid.xy, vec4f(vec3f(age_gray(age)), 1.0));
         return;
     }
+    color *= beaming;
     textureStore(out_tex, gid.xy, vec4f(color / (1.0 + color), 1.0));
 }
 
