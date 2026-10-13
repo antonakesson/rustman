@@ -1,0 +1,17 @@
+[package]
+name = "rustman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+egui-winit = "0.36.2"
+glam = "0.34"
+pollster = "1"
+wgpu = "30"
+winit = "0.30"
+
+# The ray tracer runs on the GPU, but keep the host loop reasonably fast in debug builds.
+[profile.dev]
+opt-level = 1
