@@ -1,9 +1,12 @@
 //! wgpu setup: one compute pass traces into an offscreen texture, one render pass
 //! scales it onto the window and draws the egui overlay on top.
-//! trace.wgsl is hot-reloaded when the file changes.
+//! trace.wgsl is hot-reloaded when the file changes (native only; the web build uses the
+//! copy compiled in).
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
 use winit::window::Window;
@@ -46,8 +49,11 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// What the passes render to: the sRGB variant of the swapchain format.
+    view_format: wgpu::TextureFormat,
 
     trace_layout: wgpu::BindGroupLayout,
+    #[cfg(not(target_arch = "wasm32"))]
     trace_pipeline_layout: wgpu::PipelineLayout,
     trace_pipeline: wgpu::ComputePipeline,
     trace_bind: wgpu::BindGroup,
@@ -64,23 +70,27 @@ pub struct Gpu {
     out_size: (u32, u32),
     pub render_scale: f32,
 
+    #[cfg(not(target_arch = "wasm32"))]
     shader_path: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
     shader_mtime: Option<SystemTime>,
 }
 
 impl Gpu {
     /// `objects` = bodies + the light.
-    pub fn new(window: Arc<Window>, objects: usize) -> Self {
+    pub async fn new(window: Arc<Window>, objects: usize) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance.create_surface(window.clone()).expect("create surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .expect("no suitable GPU adapter");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .expect("no suitable GPU adapter");
         let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("request device");
+            adapter.request_device(&wgpu::DeviceDescriptor::default()).await.expect("request device");
 
         let size = window.inner_size();
         let mut config = surface
@@ -90,7 +100,11 @@ impl Gpu {
         let caps = surface.get_capabilities(&adapter);
         if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
             config.format = *f;
+        } else {
+            // WebGPU canvases offer no sRGB formats, but allow an sRGB view of a linear one.
+            config.view_formats.push(config.format.add_srgb_suffix());
         }
+        let view_format = config.format.add_srgb_suffix();
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
@@ -138,11 +152,16 @@ impl Gpu {
             ..Default::default()
         });
 
+        #[cfg(not(target_arch = "wasm32"))]
         let shader_path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/trace.wgsl"));
+        #[cfg(not(target_arch = "wasm32"))]
         let shader_mtime = std::fs::metadata(&shader_path).and_then(|m| m.modified()).ok();
+        #[cfg(not(target_arch = "wasm32"))]
         let src = std::fs::read_to_string(&shader_path).unwrap_or_else(|_| TRACE_FALLBACK.to_string());
+        #[cfg(target_arch = "wasm32")]
+        let src = TRACE_FALLBACK.to_string();
         let trace_pipeline =
-            create_trace_pipeline(&device, &trace_pipeline_layout, &src).expect("trace.wgsl failed to compile");
+            create_trace_pipeline(&device, &trace_pipeline_layout, &src).await.expect("trace.wgsl failed to compile");
 
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
@@ -186,7 +205,7 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState {
                 module: &blit_module,
                 entry_point: Some("fs"),
-                targets: &[Some(config.format.into())],
+                targets: &[Some(view_format.into())],
                 compilation_options: Default::default(),
             }),
             primitive: Default::default(),
@@ -202,7 +221,7 @@ impl Gpu {
         });
 
         // Picks its sRGB or linear output path from the swapchain format.
-        let egui = egui_wgpu::Renderer::new(&device, config.format, Default::default());
+        let egui = egui_wgpu::Renderer::new(&device, view_format, Default::default());
 
         let buffer = |label, size: usize, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -233,7 +252,9 @@ impl Gpu {
             device,
             queue,
             config,
+            view_format,
             trace_layout,
+            #[cfg(not(target_arch = "wasm32"))]
             trace_pipeline_layout,
             trace_pipeline,
             trace_bind,
@@ -248,7 +269,9 @@ impl Gpu {
             chunks_buf,
             out_size: (1, 1),
             render_scale: 1.0,
+            #[cfg(not(target_arch = "wasm32"))]
             shader_path,
+            #[cfg(not(target_arch = "wasm32"))]
             shader_mtime,
         };
         gpu.resize(size.width, size.height);
@@ -330,6 +353,7 @@ impl Gpu {
     }
 
     /// Recompile trace.wgsl if it changed on disk. Errors are printed and the old pipeline kept.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn hot_reload(&mut self) {
         let mtime = std::fs::metadata(&self.shader_path).and_then(|m| m.modified()).ok();
         if mtime.is_none() || mtime == self.shader_mtime {
@@ -337,7 +361,7 @@ impl Gpu {
         }
         self.shader_mtime = mtime;
         let Ok(src) = std::fs::read_to_string(&self.shader_path) else { return };
-        match create_trace_pipeline(&self.device, &self.trace_pipeline_layout, &src) {
+        match pollster::block_on(create_trace_pipeline(&self.device, &self.trace_pipeline_layout, &src)) {
             Ok(p) => {
                 self.trace_pipeline = p;
                 println!("trace.wgsl reloaded");
@@ -376,7 +400,9 @@ impl Gpu {
             }
             _ => return,
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor { format: Some(self.view_format), ..Default::default() });
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
@@ -411,7 +437,7 @@ impl Gpu {
     }
 }
 
-fn create_trace_pipeline(
+async fn create_trace_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     src: &str,
@@ -429,7 +455,7 @@ fn create_trace_pipeline(
         compilation_options: Default::default(),
         cache: None,
     });
-    match pollster::block_on(scope.pop()) {
+    match scope.pop().await {
         Some(e) => Err(e.to_string()),
         None => Ok(pipeline),
     }

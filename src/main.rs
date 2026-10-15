@@ -10,7 +10,9 @@
 //!   V              Doppler color on/off   [ / ]         Doppler strength /1.5 / x1.5
 //!   O              relativity on/off (aberration, beaming, length contraction)
 //!   Space          pause                  H             hide / show the control panel
-//!   Esc            quit
+//!   Esc            quit (native only)
+//!
+//! Also builds for the web (WebGPU): `trunk serve`.
 
 mod gpu;
 mod sim;
@@ -18,12 +20,12 @@ mod ui;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use glam::Vec3;
+use web_time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -64,6 +66,8 @@ impl Camera {
 
 struct App {
     gpu: Option<Gpu>,
+    /// Delivers the Gpu once it's set up; on the web that finishes asynchronously.
+    proxy: EventLoopProxy<Gpu>,
     world: World,
     cam: Camera,
     c: f32,
@@ -92,9 +96,10 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(proxy: EventLoopProxy<Gpu>) -> Self {
         App {
             gpu: None,
+            proxy,
             world: World::new(),
             cam: Camera { pos: Vec3::new(0.0, 1.7, 8.25), vel: Vec3::ZERO, yaw: 0.0, pitch: -0.1 },
             c: 8.0,
@@ -124,7 +129,7 @@ impl App {
 
     fn on_key(&mut self, key: KeyCode, event_loop: &ActiveEventLoop) {
         match key {
-            KeyCode::Escape => event_loop.exit(),
+            KeyCode::Escape if !cfg!(target_arch = "wasm32") => event_loop.exit(),
             KeyCode::KeyF => self.world.light.on = !self.world.light.on,
             KeyCode::KeyM => self.world.light.moving = !self.world.light.moving,
             KeyCode::KeyL => self.toggle_flashlight(),
@@ -297,6 +302,7 @@ impl App {
         let Some(aspect) = self.gpu.as_ref().map(Gpu::aspect) else { return };
         let params = self.params(aspect);
         let Some(gpu) = &mut self.gpu else { return };
+        #[cfg(not(target_arch = "wasm32"))]
         gpu.hot_reload();
         gpu.upload(&params, &objs, &self.hist_scratch, &self.chunk_scratch);
         gpu.render(gui);
@@ -304,14 +310,17 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Gpu> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() {
+        if self.egui_state.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("rustman")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+        let attrs = Window::default_attributes().with_title("rustman");
+        #[cfg(not(target_arch = "wasm32"))]
+        let attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+        // The page's CSS sizes the canvas.
+        #[cfg(target_arch = "wasm32")]
+        let attrs = winit::platform::web::WindowAttributesExtWebSys::with_append(attrs, true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -321,7 +330,23 @@ impl ApplicationHandler for App {
             window.theme(),
             None,
         ));
-        self.gpu = Some(Gpu::new(window, self.world.bodies.len() + 1));
+        let gpu = Gpu::new(window, self.world.bodies.len() + 1);
+        let proxy = self.proxy.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = proxy.send_event(pollster::block_on(gpu));
+        // The browser can't block on the GPU handshake.
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = proxy.send_event(gpu.await);
+        });
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut gpu: Gpu) {
+        // The window may have been resized while the GPU was being set up.
+        let size = gpu.window.inner_size();
+        gpu.resize(size.width, size.height);
+        gpu.window.request_redraw();
+        self.gpu = Some(gpu);
         self.last_frame = Instant::now();
         self.update_title();
     }
@@ -373,7 +398,15 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let event_loop = EventLoop::new().expect("event loop");
-    let mut app = App::new();
-    event_loop.run_app(&mut app).expect("run app");
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+    let event_loop = EventLoop::with_user_event().build().expect("event loop");
+    let app = App::new(event_loop.create_proxy());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut app = app;
+        event_loop.run_app(&mut app).expect("run app");
+    }
+    #[cfg(target_arch = "wasm32")]
+    winit::platform::web::EventLoopExtWebSys::spawn_app(event_loop, app);
 }

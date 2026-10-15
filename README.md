@@ -50,6 +50,18 @@ Needs a recent stable Rust toolchain (edition 2024) and a GPU with Vulkan, Direc
 cargo run --release
 ```
 
+### In the browser
+
+The web build needs WebGPU (recent Chrome or Edge). With [Trunk](https://trunkrs.dev):
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk
+trunk serve --release
+```
+
+Then open http://localhost:8080. `trunk build --release` writes a static site to `dist/`. Shader hot-reload is native-only, and Esc doesn't quit.
+
 ## Controls
 
 | Key | Action |

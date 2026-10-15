@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rustman</title>
+  <link data-trunk rel="rust" data-bin="rustman">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font: 16px sans-serif; }
+    /* winit appends the canvas; it renders at whatever size this gives it. */
+    canvas { display: block; width: 100%; height: 100%; outline: none; }
+    #no-webgpu { display: none; padding: 2em; max-width: 40em; }
+  </style>
+</head>
+<body>
+  <div id="no-webgpu">
+    <h1>WebGPU not available</h1>
+    <p>rustman traces rays in a compute shader, which needs WebGPU. Try a recent Chrome or Edge.</p>
+  </div>
+  <script>
+    if (!navigator.gpu) document.getElementById("no-webgpu").style.display = "block";
+  </script>
+</body>
+</html>
